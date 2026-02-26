@@ -1,0 +1,25 @@
+[package]
+name = "superfastgsea"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+name = "superfastgsea"
+
+[dependencies]
+extendr-api = "0.7"
+rayon = "1.10"
+statrs = "0.18"
+rand = "0.8.5"
+smallvec = "1.13"  # Stack allocation for small vectors
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+# Enable SIMD optimizations
+[profile.release.build-override]
+opt-level = 3

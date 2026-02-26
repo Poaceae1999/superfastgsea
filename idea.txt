@@ -1,0 +1,54 @@
+選擇 Rust 絕對是最具前瞻性的決定。Rust 的「所有權 (Ownership)」機制與「借用檢查器 (Borrow Checker)」能在編譯階段就徹底消滅 C++ 常見的記憶體洩漏 (Memory Leak) 與隨機指標錯誤 (Dangling Pointers) 問題，這對於需要在伺服器上長時間穩定運行、處理巨量 DESeq2 統計結果的應用程式來說，是無可取代的優勢。
+我們將使用 rextendr (R 與 Rust 的橋接器) 來建構這個架構。以下是 superfastGSEA 套件的系統架構圖與模組解析：
+superfastGSEA 系統架構圖
+
+Plaintext
+
+
+[R Environment] (使用者介面與資料預處理)
+      │
+      ├─ 輸入: DESeq2 stat/log2FC 向量, Pathways 列表
+      ├─ `R/superfastGSEA.R` (R Wrapper 函數)
+      │    └─ 參數驗證、NA 處理、ID 轉換
+      │
+[The FFI Bridge] (跨語言記憶體安全交接)
+      │
+      ├─ `src/rust/src/lib.rs` (extendr API 進入點)
+      │    └─ 將 R 的 NumericVector 零成本抽象轉換為 Rust 的 &[f64] 切片
+      │
+[Rust Core Backend] (極速運算引擎 - 零記憶體洩漏保證)
+      │
+      ├─ [Concurrency Manager] (並行控制)
+      │    └─ 依賴: `rayon` crate (資料平行化，自動榨乾多核心)
+      │
+      ├─ [Worker Node] (針對單一 Pathway 獨立運算)
+      │    │
+      │    ├─ 1. SIMD ES Calculator (真實 ES 計算)
+      │    │      └─ 依賴: `std::simd` 或 `ndarray` 進行硬體級別向量加速
+      │    │
+      │    ├─ 2. Anchor Permutation Engine (錨點抽樣)
+      │    │      └─ 依賴: `rand` crate (快速生成 200 組隨機背景 ES)
+      │    │
+      │    ├─ 3. Statistical Approximator (降維逼近器)
+      │    │      ├─ 成功: 使用 `statrs` crate 擬合 Gamma 分佈並計算 CDF (P-value)
+      │    │      └─ 失敗 (Fallback): 若基因數過少導致擬合失敗，無縫切換至動態規劃模組
+      │    │
+      │    └─ 4. Result Struct Builder
+      │           └─ 將 ES, NES, P-value 封裝為安全的 Rust Struct
+      │
+[Output Serialization]
+      │
+      └─ 透過 `extendr` 將 Rust Struct 轉換回 R 的 data.frame，回傳給前端
+
+
+架構核心亮點與落地策略
+1. 前端極簡，後端重裝 (The Mullet Architecture)
+使用者在 R console 中只會看到標準的 R 函數 superfastGSEA(stats, pathways)。當使用者餵入 DESeq2 處理好的 count data 統計結果時，R 端只做最輕量的格式檢查，隨即將資料指標（而非複製整份資料）傳遞給 Rust。這大幅降低了記憶體拷貝的開銷。
+2. Rayon 的無畏並行 (Fearless Concurrency)
+在傳統 C++ (Rcpp) 中寫多執行緒極度痛苦且容易造成 R session 崩潰。在 Rust 層，我們可以使用 rayon 處理 Pathways 的迴圈。因為 Rust 在編譯期就保證了資料競爭 (Data Race) 是不可能發生的，你可以放心地將數千個 Pathways 直接分散到所有 CPU 核心上同時計算 ES 與配適 Gamma 分佈。
+3. 優雅的 Fallback 防禦機制
+演算法的穩定性取決於極端狀況的處理。在 Rust Worker Node 中，我們設計了「統計逼近器」。如果某個 Pathway 只有 3 個基因，導致 Gamma 分佈的參數無法收斂，Rust 的 Result<T, E> 錯誤處理機制會捕捉到這個狀態，並自動觸發 Fallback 模組，改用傳統的精確演算法處理這少數的特例，確保整個分析流程絕對不會因此中斷。
+4. 雲端 CI/CD 測試矩陣 (解決本地環境限制)
+由於這是一個包含編譯語言的套件，且開發環境若不支援虛擬機，本地端將無法測試 Windows 或 Linux 等不同作業系統的編譯狀況。因此，這個架構必須深度依賴 GitHub Actions。每次你 Commit 程式碼時，GitHub 的伺服器會自動啟動跨平台的 CI 流程，安裝 Rust 工具鏈 (cargo)，編譯你的套件，並執行單元測試，確保這個套件未來部署到任何雲端伺服器 (如 Google Cloud Run) 都能順利啟動。
+你想先看一段如何使用 extendr 在 Rust 端定義接收 DESeq2 數據並啟動 rayon 平行處理的基礎程式碼嗎？
+
