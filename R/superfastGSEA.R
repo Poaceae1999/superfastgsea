@@ -143,40 +143,15 @@ superfastGSEA <- function(
         )
     }
 
-    # Remove NA values with warning
-    na_count <- sum(is.na(stats))
-    if (na_count > 0) {
-        warning(sprintf("Removed %d genes with NA statistics", na_count))
-        stats <- stats[!is.na(stats)]
-    }
-
-    # Sort stats in decreasing order
-    stats <- sort(stats, decreasing = TRUE)
-    gene_names <- names(stats)
-    stats_values <- unname(stats)
-
-    # Convert pathways to indices
-    pathway_names <- names(pathways)
-    if (is.null(pathway_names)) {
-        pathway_names <- paste0("pathway_", seq_along(pathways))
-    }
-
-    # Map gene names to indices (1-based for R)
-    gene_to_idx <- setNames(seq_along(gene_names), gene_names)
-
-    pathway_indices <- lapply(pathways, function(genes) {
-        idx <- gene_to_idx[genes]
-        as.integer(idx[!is.na(idx)])  # Remove genes not in stats
-    })
-
-    # Handle maxSize = Inf
+    # Prepare shared inputs
+    inputs <- .prepareGSEAInputs(pathways, stats)
     maxSize_int <- if (is.infinite(maxSize)) -1L else as.integer(maxSize)
 
     # Call Rust backend with method selection
     result <- run_gsea_rust_with_method(
-        stats = stats_values,
-        pathway_indices = pathway_indices,
-        pathway_names = pathway_names,
+        stats = inputs$stats_values,
+        pathway_indices = inputs$pathway_indices,
+        pathway_names = inputs$pathway_names,
         gsea_param = as.double(gseaParam),
         n_anchors = as.integer(nAnchors),
         min_size = as.integer(minSize),
@@ -185,46 +160,7 @@ superfastGSEA <- function(
         method = method
     )
 
-    # Convert list result to data.frame manually (to handle list column)
-    if (!is.data.frame(result)) {
-        # Extract leadingEdge separately as it's a list column
-        le <- result$leadingEdge
-        result$leadingEdge <- NULL
-
-        # Create data frame from other columns
-        result <- data.frame(
-            pathway = result$pathway,
-            pval = result$pval,
-            ES = result$ES,
-            NES = result$NES,
-            size = result$size,
-            stringsAsFactors = FALSE
-        )
-
-        # Add leadingEdge as list column
-        result$leadingEdge <- le
-    }
-
-    # Calculate adjusted p-values
-    result$padj <- .adjustPvalues(result$pval, pAdjustMethod)
-
-    # Apply eps threshold to p-values
-    result$pval <- pmax(result$pval, eps)
-    result$padj <- pmax(result$padj, eps)
-
-    # Convert leading edge indices back to gene names
-    result$leadingEdge <- lapply(result$leadingEdge, function(idx) {
-        gene_names[idx]
-    })
-
-    # Reorder columns to match fgsea output
-    result <- result[, c("pathway", "pval", "padj", "ES", "NES", "size", "leadingEdge")]
-
-    # Sort by p-value
-    result <- result[order(result$pval), ]
-    rownames(result) <- NULL
-
-    return(result)
+    .formatGSEAResult(result, inputs$gene_names, eps, pAdjustMethod)
 }
 
 #' Test Rust Bridge
@@ -283,38 +219,14 @@ calcES <- function(stats, geneSet, gseaParam = 1) {
                              fineAnchors = 200L,
                              pvalueThreshold = 0.2,
                              pAdjustMethod = "BH") {
-    # Remove NA values
-    na_count <- sum(is.na(stats))
-    if (na_count > 0) {
-        warning(sprintf("Removed %d genes with NA statistics", na_count))
-        stats <- stats[!is.na(stats)]
-    }
-
-    # Sort stats
-    stats <- sort(stats, decreasing = TRUE)
-    gene_names <- names(stats)
-    stats_values <- unname(stats)
-
-    # Convert pathways to indices
-    pathway_names <- names(pathways)
-    if (is.null(pathway_names)) {
-        pathway_names <- paste0("pathway_", seq_along(pathways))
-    }
-
-    gene_to_idx <- setNames(seq_along(gene_names), gene_names)
-    pathway_indices <- lapply(pathways, function(genes) {
-        idx <- gene_to_idx[genes]
-        as.integer(idx[!is.na(idx)])
-    })
-
-    # Handle maxSize = Inf
+    inputs <- .prepareGSEAInputs(pathways, stats)
     maxSize_int <- if (is.infinite(maxSize)) -1L else as.integer(maxSize)
 
     # Call Rust backend with two-pass
     result <- run_gsea_rust_two_pass(
-        stats = stats_values,
-        pathway_indices = pathway_indices,
-        pathway_names = pathway_names,
+        stats = inputs$stats_values,
+        pathway_indices = inputs$pathway_indices,
+        pathway_names = inputs$pathway_names,
         gsea_param = as.double(gseaParam),
         min_size = as.integer(minSize),
         max_size = maxSize_int,
@@ -324,129 +236,30 @@ calcES <- function(stats, geneSet, gseaParam = 1) {
         pvalue_threshold = as.double(pvalueThreshold)
     )
 
-    # Store pass statistics
-    coarse_filtered <- result$coarse_filtered
-    fine_calculated <- result$fine_calculated
-
-    # Convert to data frame
-    le <- result$leadingEdge
-    result$leadingEdge <- NULL
-    result$coarse_filtered <- NULL
-    result$fine_calculated <- NULL
-
-    result <- data.frame(
-        pathway = result$pathway,
-        pval = result$pval,
-        ES = result$ES,
-        NES = result$NES,
-        size = result$size,
-        stringsAsFactors = FALSE
-    )
-    result$leadingEdge <- le
-
-    # Calculate adjusted p-values
-    result$padj <- .adjustPvalues(result$pval, pAdjustMethod)
-    result$pval <- pmax(result$pval, eps)
-    result$padj <- pmax(result$padj, eps)
-
-    # Convert leading edge indices to gene names
-    result$leadingEdge <- lapply(result$leadingEdge, function(idx) {
-        gene_names[idx]
-    })
-
-    # Reorder columns
-    result <- result[, c("pathway", "pval", "padj", "ES", "NES", "size", "leadingEdge")]
-    result <- result[order(result$pval), ]
-    rownames(result) <- NULL
-
-    # Add attributes for diagnostics
-    attr(result, "coarse_filtered") <- coarse_filtered
-    attr(result, "fine_calculated") <- fine_calculated
-    attr(result, "pAdjustMethod") <- pAdjustMethod
-
-    return(result)
+    .formatGSEAResult(result, inputs$gene_names, eps, pAdjustMethod,
+                      extra_fields = c("coarse_filtered", "fine_calculated"))
 }
 
 #' Internal: Run GSEA with adaptive sampling
 #' @keywords internal
 .runAdaptiveGSEA <- function(pathways, stats, minSize, maxSize, scoreType,
                               eps, gseaParam, pAdjustMethod = "BH") {
-    # Remove NA values
-    na_count <- sum(is.na(stats))
-    if (na_count > 0) {
-        warning(sprintf("Removed %d genes with NA statistics", na_count))
-        stats <- stats[!is.na(stats)]
-    }
-
-    # Sort stats
-    stats <- sort(stats, decreasing = TRUE)
-    gene_names <- names(stats)
-    stats_values <- unname(stats)
-
-    # Convert pathways to indices
-    pathway_names <- names(pathways)
-    if (is.null(pathway_names)) {
-        pathway_names <- paste0("pathway_", seq_along(pathways))
-    }
-
-    gene_to_idx <- setNames(seq_along(gene_names), gene_names)
-    pathway_indices <- lapply(pathways, function(genes) {
-        idx <- gene_to_idx[genes]
-        as.integer(idx[!is.na(idx)])
-    })
-
-    # Handle maxSize = Inf
+    inputs <- .prepareGSEAInputs(pathways, stats)
     maxSize_int <- if (is.infinite(maxSize)) -1L else as.integer(maxSize)
 
     # Call Rust backend with adaptive sampling
     result <- run_gsea_rust_adaptive(
-        stats = stats_values,
-        pathway_indices = pathway_indices,
-        pathway_names = pathway_names,
+        stats = inputs$stats_values,
+        pathway_indices = inputs$pathway_indices,
+        pathway_names = inputs$pathway_names,
         gsea_param = as.double(gseaParam),
         min_size = as.integer(minSize),
         max_size = maxSize_int,
         score_type = scoreType
     )
 
-    # Store total samples for reference
-    total_samples <- result$total_samples
-
-    # Convert to data frame
-    le <- result$leadingEdge
-    result$leadingEdge <- NULL
-    result$total_samples <- NULL
-
-    result <- data.frame(
-        pathway = result$pathway,
-        pval = result$pval,
-        ES = result$ES,
-        NES = result$NES,
-        size = result$size,
-        stringsAsFactors = FALSE
-    )
-    result$leadingEdge <- le
-
-    # Calculate adjusted p-values
-    result$padj <- .adjustPvalues(result$pval, pAdjustMethod)
-    result$pval <- pmax(result$pval, eps)
-    result$padj <- pmax(result$padj, eps)
-
-    # Convert leading edge indices to gene names
-    result$leadingEdge <- lapply(result$leadingEdge, function(idx) {
-        gene_names[idx]
-    })
-
-    # Reorder columns
-    result <- result[, c("pathway", "pval", "padj", "ES", "NES", "size", "leadingEdge")]
-    result <- result[order(result$pval), ]
-    rownames(result) <- NULL
-
-    # Add attribute for total samples used
-    attr(result, "total_samples") <- total_samples
-    attr(result, "pAdjustMethod") <- pAdjustMethod
-
-    return(result)
+    .formatGSEAResult(result, inputs$gene_names, eps, pAdjustMethod,
+                      extra_fields = c("total_samples"))
 }
 
 #' Internal: Run hybrid GSEA (fgsea for small pathways, Gamma for large pathways)
@@ -462,16 +275,10 @@ calcES <- function(stats, geneSet, gseaParam = 1) {
         stop("Package 'fgsea' is required for hybrid method. Install with: BiocManager::install('fgsea')")
     }
 
-    # Remove NA values
-    na_count <- sum(is.na(stats))
-    if (na_count > 0) {
-        warning(sprintf("Removed %d genes with NA statistics", na_count))
-        stats <- stats[!is.na(stats)]
-    }
-
-    # Sort stats
-    stats <- sort(stats, decreasing = TRUE)
-    gene_names <- names(stats)
+    inputs <- .prepareGSEAInputs(pathways, stats)
+    gene_names <- inputs$gene_names
+    # Reconstruct named stats for fgsea (requires named vector)
+    stats <- setNames(inputs$stats_values, gene_names)
 
     # Calculate pathway sizes (after filtering for genes in stats)
     pathway_sizes <- sapply(pathways, function(genes) {
@@ -562,14 +369,40 @@ calcES <- function(stats, geneSet, gseaParam = 1) {
 #' @keywords internal
 .runBatchGSEA <- function(pathways, stats, minSize, maxSize, scoreType,
                           eps, gseaParam, nAnchors, pAdjustMethod = "BH") {
-    # Remove NA values
+    inputs <- .prepareGSEAInputs(pathways, stats)
+    maxSize_int <- if (is.infinite(maxSize)) -1L else as.integer(maxSize)
+
+    # Set default nAnchors
+    if (is.null(nAnchors)) {
+        nAnchors <- 200L
+    }
+
+    # Call Rust backend with batch optimization
+    result <- run_gsea_rust_batch(
+        stats = inputs$stats_values,
+        pathway_indices = inputs$pathway_indices,
+        pathway_names = inputs$pathway_names,
+        gsea_param = as.double(gseaParam),
+        n_anchors = as.integer(nAnchors),
+        min_size = as.integer(minSize),
+        max_size = maxSize_int,
+        score_type = scoreType
+    )
+
+    .formatGSEAResult(result, inputs$gene_names, eps, pAdjustMethod)
+}
+
+#' Internal: Prepare GSEA inputs (shared by all method runners)
+#' @keywords internal
+.prepareGSEAInputs <- function(pathways, stats) {
+    # Remove NA values with warning
     na_count <- sum(is.na(stats))
     if (na_count > 0) {
         warning(sprintf("Removed %d genes with NA statistics", na_count))
         stats <- stats[!is.na(stats)]
     }
 
-    # Sort stats
+    # Sort stats in decreasing order
     stats <- sort(stats, decreasing = TRUE)
     gene_names <- names(stats)
     stats_values <- unname(stats)
@@ -580,36 +413,39 @@ calcES <- function(stats, geneSet, gseaParam = 1) {
         pathway_names <- paste0("pathway_", seq_along(pathways))
     }
 
+    # Map gene names to indices (1-based for R)
     gene_to_idx <- setNames(seq_along(gene_names), gene_names)
     pathway_indices <- lapply(pathways, function(genes) {
         idx <- gene_to_idx[genes]
         as.integer(idx[!is.na(idx)])
     })
 
-    # Handle maxSize = Inf
-    maxSize_int <- if (is.infinite(maxSize)) -1L else as.integer(maxSize)
-
-    # Set default nAnchors
-    if (is.null(nAnchors)) {
-        nAnchors <- 200L
-    }
-
-    # Call Rust backend with batch optimization
-    result <- run_gsea_rust_batch(
-        stats = stats_values,
-        pathway_indices = pathway_indices,
+    list(
+        gene_names = gene_names,
+        stats_values = stats_values,
         pathway_names = pathway_names,
-        gsea_param = as.double(gseaParam),
-        n_anchors = as.integer(nAnchors),
-        min_size = as.integer(minSize),
-        max_size = maxSize_int,
-        score_type = scoreType
+        pathway_indices = pathway_indices
     )
+}
 
-    # Convert to data frame
+#' Internal: Format Rust GSEA result into standard data.frame
+#' @keywords internal
+.formatGSEAResult <- function(result, gene_names, eps, pAdjustMethod,
+                               extra_fields = NULL) {
+    # Extract leadingEdge separately as it's a list column
     le <- result$leadingEdge
     result$leadingEdge <- NULL
 
+    # Remove any extra fields from the list before making data.frame
+    extra_values <- list()
+    if (!is.null(extra_fields)) {
+        for (f in extra_fields) {
+            extra_values[[f]] <- result[[f]]
+            result[[f]] <- NULL
+        }
+    }
+
+    # Create data frame from other columns
     result <- data.frame(
         pathway = result$pathway,
         pval = result$pval,
@@ -622,6 +458,8 @@ calcES <- function(stats, geneSet, gseaParam = 1) {
 
     # Calculate adjusted p-values
     result$padj <- .adjustPvalues(result$pval, pAdjustMethod)
+
+    # Apply eps threshold
     result$pval <- pmax(result$pval, eps)
     result$padj <- pmax(result$padj, eps)
 
@@ -630,15 +468,20 @@ calcES <- function(stats, geneSet, gseaParam = 1) {
         gene_names[idx]
     })
 
-    # Reorder columns
+    # Reorder columns to match fgsea output
     result <- result[, c("pathway", "pval", "padj", "ES", "NES", "size", "leadingEdge")]
+
+    # Sort by p-value
     result <- result[order(result$pval), ]
     rownames(result) <- NULL
 
-    # Add attribute for adjustment method used
+    # Attach extra fields as attributes
+    for (f in names(extra_values)) {
+        attr(result, f) <- extra_values[[f]]
+    }
     attr(result, "pAdjustMethod") <- pAdjustMethod
 
-    return(result)
+    result
 }
 
 #' Internal: Calculate adjusted p-values with multiple methods
