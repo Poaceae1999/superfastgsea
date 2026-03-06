@@ -56,6 +56,7 @@ jobs:
         uses: r-lib/actions/check-r-package@v2
         with:
           upload-snapshots: true
+          error-on: '"error"'
 
   rust-tests:
     runs-on: ubuntu-latest
