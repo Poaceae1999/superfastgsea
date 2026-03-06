@@ -56,6 +56,7 @@ jobs:
         uses: r-lib/actions/check-r-package@v2
         with:
           upload-snapshots: true
+          error-on: '"error"'
 
   rust-tests:
     runs-on: ubuntu-latest
@@ -63,6 +64,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: 'release'
+          use-public-rspm: true
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable

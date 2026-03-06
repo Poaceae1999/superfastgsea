@@ -53,6 +53,9 @@ const SIZE_BIN_WIDTH: usize = 15;
 /// 500+ recommended for better accuracy than Gamma
 const DEFAULT_N_ANCHORS_GPD: usize = 500;
 
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
 
 /// Cached parameters for either method
 enum CachedParams {
@@ -63,25 +66,174 @@ enum CachedParams {
 /// Get the representative size for a pathway size (bin center)
 #[inline]
 fn get_size_bin(size: usize) -> usize {
-    // Round to nearest bin center
     let bin = size / SIZE_BIN_WIDTH;
     bin * SIZE_BIN_WIDTH + SIZE_BIN_WIDTH / 2
 }
 
+/// Filter pathways by size bounds, returning (original_index, pathway, name) triples.
+fn filter_pathways_by_size<'a>(
+    pathways: &'a [Vec<usize>],
+    pathway_names: &'a [String],
+    min_size: usize,
+    max_size: usize,
+) -> Vec<(usize, &'a Vec<usize>, &'a String)> {
+    pathways
+        .iter()
+        .zip(pathway_names.iter())
+        .enumerate()
+        .filter(|(_, (pathway, _))| {
+            let size = pathway.len();
+            size >= min_size && size <= max_size
+        })
+        .map(|(i, (pathway, name))| (i, pathway, name))
+        .collect()
+}
+
+/// Collect unique size bins from filtered pathways (sorted, deduplicated,
+/// excluding bins below MIN_SIZE_FOR_GAMMA).
+fn collect_unique_size_bins(filtered: &[(usize, &Vec<usize>, &String)]) -> Vec<usize> {
+    let mut bins: Vec<usize> = filtered
+        .iter()
+        .map(|(_, pathway, _)| get_size_bin(pathway.len()))
+        .filter(|&bin| bin >= MIN_SIZE_FOR_GAMMA)
+        .collect();
+    bins.sort_unstable();
+    bins.dedup();
+    bins
+}
+
+/// Apply score type filter to an enrichment score.
+#[inline]
+fn apply_score_type(es: f64, score_type: &str) -> f64 {
+    match score_type {
+        "pos" if es < 0.0 => 0.0,
+        "neg" if es > 0.0 => 0.0,
+        _ => es,
+    }
+}
+
+/// Build a Gamma parameter cache for the given size bins using fixed-anchor fitting.
+fn build_gamma_cache(
+    stats: &[f64],
+    unique_bins: &[usize],
+    n_anchors: usize,
+    gsea_param: f64,
+) -> HashMap<usize, Option<(GammaParams, GammaParams)>> {
+    unique_bins
+        .par_iter()
+        .map(|&bin_size| {
+            let params = fit_gamma_null(stats, bin_size, n_anchors, gsea_param).ok();
+            (bin_size, params)
+        })
+        .collect()
+}
+
+/// Compute p-value and NES for a single pathway using a method-aware cache.
+/// Falls back to permutation when the gene set is too small or fitting failed.
+fn compute_pval_nes(
+    stats: &[f64],
+    pathway: &[usize],
+    filtered_es: f64,
+    gsea_param: f64,
+    cache: &HashMap<usize, CachedParams>,
+) -> (f64, f64) {
+    let size = pathway.len();
+    if size < MIN_SIZE_FOR_GAMMA {
+        return permutation_fallback(stats, pathway, filtered_es, gsea_param);
+    }
+    let lookup = get_size_bin(size);
+    match cache.get(&lookup) {
+        Some(CachedParams::Gamma(Some((pos, neg)))) => {
+            (gamma_pvalue(filtered_es, pos, neg), calculate_nes(filtered_es, pos, neg))
+        }
+        Some(CachedParams::EmpiricalGpd(Some(params))) => {
+            (empirical_gpd_pvalue(filtered_es, params), calculate_nes_empirical(filtered_es, params))
+        }
+        _ => permutation_fallback(stats, pathway, filtered_es, gsea_param),
+    }
+}
+
+/// Compute p-value and NES for a single pathway using a Gamma-only cache.
+/// Falls back to permutation when the gene set is too small or fitting failed.
+fn compute_pval_nes_gamma(
+    stats: &[f64],
+    pathway: &[usize],
+    filtered_es: f64,
+    gsea_param: f64,
+    gamma_cache: &HashMap<usize, Option<(GammaParams, GammaParams)>>,
+) -> (f64, f64) {
+    let size = pathway.len();
+    if size < MIN_SIZE_FOR_GAMMA {
+        return permutation_fallback(stats, pathway, filtered_es, gsea_param);
+    }
+    let bin_size = get_size_bin(size);
+    match gamma_cache.get(&bin_size) {
+        Some(Some((pos, neg))) => {
+            (gamma_pvalue(filtered_es, pos, neg), calculate_nes(filtered_es, pos, neg))
+        }
+        _ => permutation_fallback(stats, pathway, filtered_es, gsea_param),
+    }
+}
+
+/// Permutation-based p-value/NES fallback for small or failed-fit gene sets.
+#[inline]
+fn permutation_fallback(stats: &[f64], pathway: &[usize], filtered_es: f64, gsea_param: f64) -> (f64, f64) {
+    let (p, mean_pos, mean_neg) = permutation_pvalue(stats, pathway, gsea_param, DEFAULT_N_PERM);
+    let n = calculate_nes_permutation(filtered_es, mean_pos, mean_neg);
+    (p, n)
+}
+
+/// Analyze a single pathway using a Gamma-only cache.
+fn analyze_pathway_gamma(
+    stats: &[f64],
+    pathway: &[usize],
+    name: &str,
+    gsea_param: f64,
+    score_type: &str,
+    gamma_cache: &HashMap<usize, Option<(GammaParams, GammaParams)>>,
+) -> GseaResult {
+    let (es, leading_edge) = calc_enrichment_score_sparse(stats, pathway, gsea_param);
+    let filtered_es = apply_score_type(es, score_type);
+    let (pval, nes) = compute_pval_nes_gamma(stats, pathway, filtered_es, gsea_param, gamma_cache);
+
+    GseaResult {
+        pathway: name.to_string(),
+        es: filtered_es,
+        nes,
+        pval,
+        size: pathway.len(),
+        leading_edge,
+    }
+}
+
+/// Analyze a single pathway using a method-aware cache.
+fn analyze_pathway_with_cache(
+    stats: &[f64],
+    pathway: &[usize],
+    name: &str,
+    gsea_param: f64,
+    score_type: &str,
+    cache: &HashMap<usize, CachedParams>,
+) -> GseaResult {
+    let (es, leading_edge) = calc_enrichment_score_sparse(stats, pathway, gsea_param);
+    let filtered_es = apply_score_type(es, score_type);
+    let (pval, nes) = compute_pval_nes(stats, pathway, filtered_es, gsea_param, cache);
+
+    GseaResult {
+        pathway: name.to_string(),
+        es: filtered_es,
+        nes,
+        pval,
+        size: pathway.len(),
+        leading_edge,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
 /// Run GSEA analysis on multiple pathways in parallel with Gamma parameter caching
-///
-/// # Arguments
-/// * `stats` - Gene statistics (should be sorted in decreasing order)
-/// * `pathways` - Vector of gene set indices (0-based)
-/// * `pathway_names` - Names of pathways
-/// * `gsea_param` - Weighting parameter
-/// * `n_anchors` - Number of anchors for Gamma fitting
-/// * `min_size` - Minimum pathway size filter
-/// * `max_size` - Maximum pathway size filter
-/// * `score_type` - "std", "pos", or "neg"
-///
-/// # Returns
-/// Vector of GSEA results
 pub fn run_gsea_parallel(
     stats: &[f64],
     pathways: &[Vec<usize>],
@@ -92,77 +244,20 @@ pub fn run_gsea_parallel(
     max_size: usize,
     score_type: &str,
 ) -> Vec<GseaResult> {
-    // Use higher anchor count for better accuracy since it's shared
-    let effective_anchors = if n_anchors < DEFAULT_N_ANCHORS {
-        DEFAULT_N_ANCHORS
-    } else {
-        n_anchors
-    };
+    let effective_anchors = n_anchors.max(DEFAULT_N_ANCHORS);
+    let filtered = filter_pathways_by_size(pathways, pathway_names, min_size, max_size);
+    let unique_bins = collect_unique_size_bins(&filtered);
+    let gamma_cache = build_gamma_cache(stats, &unique_bins, effective_anchors, gsea_param);
 
-    // Pre-filter pathways by size
-    let filtered: Vec<(usize, &Vec<usize>, &String)> = pathways
-        .iter()
-        .zip(pathway_names.iter())
-        .enumerate()
-        .filter(|(_, (pathway, _))| {
-            let size = pathway.len();
-            size >= min_size && size <= max_size
-        })
-        .map(|(i, (pathway, name))| (i, pathway, name))
-        .collect();
-
-    // Collect unique size BINS that need Gamma fitting (not every unique size)
-    // Using sort + dedup instead of HashSet to reduce allocation overhead
-    let mut unique_bins: Vec<usize> = filtered
-        .iter()
-        .map(|(_, pathway, _)| get_size_bin(pathway.len()))
-        .filter(|&bin| bin >= MIN_SIZE_FOR_GAMMA)
-        .collect();
-    unique_bins.sort_unstable();
-    unique_bins.dedup();
-
-    // Pre-compute Gamma parameters for all unique size bins in parallel
-    let gamma_cache: HashMap<usize, Option<(GammaParams, GammaParams)>> = unique_bins
-        .par_iter()
-        .map(|&bin_size| {
-            let params = fit_gamma_null(stats, bin_size, effective_anchors, gsea_param).ok();
-            (bin_size, params)
-        })
-        .collect();
-
-    // Now process all pathways in parallel using cached Gamma parameters
-    let results: Vec<GseaResult> = filtered
+    filtered
         .par_iter()
         .map(|(_, pathway, name)| {
-            analyze_single_pathway_cached(
-                stats,
-                pathway,
-                name,
-                gsea_param,
-                score_type,
-                &gamma_cache,
-            )
+            analyze_pathway_gamma(stats, pathway, name, gsea_param, score_type, &gamma_cache)
         })
-        .collect();
-
-    results
+        .collect()
 }
 
-/// Run GSEA analysis with method selection
-///
-/// # Arguments
-/// * `stats` - Gene statistics (should be sorted in decreasing order)
-/// * `pathways` - Vector of gene set indices (0-based)
-/// * `pathway_names` - Names of pathways
-/// * `gsea_param` - Weighting parameter
-/// * `n_anchors` - Number of anchors for fitting
-/// * `min_size` - Minimum pathway size filter
-/// * `max_size` - Maximum pathway size filter
-/// * `score_type` - "std", "pos", or "neg"
-/// * `method` - PvalueMethod::Gamma or PvalueMethod::EmpiricalGpd
-///
-/// # Returns
-/// Vector of GSEA results
+/// Run GSEA analysis with method selection (Gamma or Empirical+GPD)
 pub fn run_gsea_parallel_with_method(
     stats: &[f64],
     pathways: &[Vec<usize>],
@@ -174,49 +269,17 @@ pub fn run_gsea_parallel_with_method(
     score_type: &str,
     method: PvalueMethod,
 ) -> Vec<GseaResult> {
-    // Set appropriate anchor count based on method
     let effective_anchors = match method {
-        PvalueMethod::Gamma => {
-            if n_anchors < DEFAULT_N_ANCHORS {
-                DEFAULT_N_ANCHORS
-            } else {
-                n_anchors
-            }
-        }
-        PvalueMethod::EmpiricalGpd => {
-            if n_anchors < DEFAULT_N_ANCHORS_GPD {
-                DEFAULT_N_ANCHORS_GPD
-            } else {
-                n_anchors
-            }
-        }
+        PvalueMethod::Gamma => n_anchors.max(DEFAULT_N_ANCHORS),
+        PvalueMethod::EmpiricalGpd => n_anchors.max(DEFAULT_N_ANCHORS_GPD),
     };
 
-    // Pre-filter pathways by size
-    let filtered: Vec<(usize, &Vec<usize>, &String)> = pathways
-        .iter()
-        .zip(pathway_names.iter())
-        .enumerate()
-        .filter(|(_, (pathway, _))| {
-            let size = pathway.len();
-            size >= min_size && size <= max_size
-        })
-        .map(|(i, (pathway, name))| (i, pathway, name))
-        .collect();
+    let filtered = filter_pathways_by_size(pathways, pathway_names, min_size, max_size);
+    let unique_bins = collect_unique_size_bins(&filtered);
 
-    // Collect unique size bins that need parameter fitting
-    let mut unique_sizes: Vec<usize> = filtered
-        .iter()
-        .map(|(_, pathway, _)| get_size_bin(pathway.len()))
-        .filter(|&bin| bin >= MIN_SIZE_FOR_GAMMA)
-        .collect();
-    unique_sizes.sort_unstable();
-    unique_sizes.dedup();
-
-    // Pre-compute parameters based on method
     let params_cache: HashMap<usize, CachedParams> = match method {
         PvalueMethod::Gamma => {
-            unique_sizes
+            unique_bins
                 .par_iter()
                 .map(|&bin_size| {
                     let params = fit_gamma_null(stats, bin_size, effective_anchors, gsea_param).ok();
@@ -225,15 +288,11 @@ pub fn run_gsea_parallel_with_method(
                 .collect()
         }
         PvalueMethod::EmpiricalGpd => {
-            unique_sizes
+            unique_bins
                 .par_iter()
                 .map(|&bin_size| {
                     let params = fit_empirical_gpd_null(
-                        stats,
-                        bin_size,
-                        effective_anchors,
-                        gsea_param,
-                        None, // Use default tail proportion
+                        stats, bin_size, effective_anchors, gsea_param, None,
                     )
                     .ok();
                     (bin_size, CachedParams::EmpiricalGpd(params))
@@ -242,164 +301,12 @@ pub fn run_gsea_parallel_with_method(
         }
     };
 
-    // Process all pathways in parallel
-    let results: Vec<GseaResult> = filtered
+    filtered
         .par_iter()
         .map(|(_, pathway, name)| {
-            analyze_single_pathway_with_method(
-                stats,
-                pathway,
-                name,
-                gsea_param,
-                score_type,
-                &params_cache,
-                method,
-            )
+            analyze_pathway_with_cache(stats, pathway, name, gsea_param, score_type, &params_cache)
         })
-        .collect();
-
-    results
-}
-
-/// Analyze a single pathway with method selection
-fn analyze_single_pathway_with_method(
-    stats: &[f64],
-    pathway: &[usize],
-    name: &str,
-    gsea_param: f64,
-    score_type: &str,
-    params_cache: &HashMap<usize, CachedParams>,
-    _method: PvalueMethod,
-) -> GseaResult {
-    let size = pathway.len();
-
-    // Calculate observed ES
-    let (es, leading_edge) = calc_enrichment_score_sparse(stats, pathway, gsea_param);
-
-    // Apply score type filter
-    let filtered_es = match score_type {
-        "pos" => {
-            if es < 0.0 {
-                0.0
-            } else {
-                es
-            }
-        }
-        "neg" => {
-            if es > 0.0 {
-                0.0
-            } else {
-                es
-            }
-        }
-        _ => es,
-    };
-
-    // Calculate p-value and NES
-    let (pval, nes) = if size < MIN_SIZE_FOR_GAMMA {
-        // Use permutation for very small gene sets (size < 10)
-        let (p, mean_pos, mean_neg) = permutation_pvalue(stats, pathway, gsea_param, DEFAULT_N_PERM);
-        let n = calculate_nes_permutation(filtered_es, mean_pos, mean_neg);
-        (p, n)
-    } else {
-        let lookup_size = get_size_bin(size);
-        match params_cache.get(&lookup_size) {
-            Some(CachedParams::Gamma(Some((pos_params, neg_params)))) => {
-                let p = gamma_pvalue(filtered_es, pos_params, neg_params);
-                let n = calculate_nes(filtered_es, pos_params, neg_params);
-                (p, n)
-            }
-            Some(CachedParams::EmpiricalGpd(Some(params))) => {
-                let p = empirical_gpd_pvalue(filtered_es, params);
-                let n = calculate_nes_empirical(filtered_es, params);
-                (p, n)
-            }
-            _ => {
-                // Fallback to permutation if fitting failed
-                let (p, mean_pos, mean_neg) =
-                    permutation_pvalue(stats, pathway, gsea_param, DEFAULT_N_PERM);
-                let n = calculate_nes_permutation(filtered_es, mean_pos, mean_neg);
-                (p, n)
-            }
-        }
-    };
-
-    GseaResult {
-        pathway: name.to_string(),
-        es: filtered_es,
-        nes,
-        pval,
-        size,
-        leading_edge,
-    }
-}
-
-/// Analyze a single pathway using cached Gamma parameters
-fn analyze_single_pathway_cached(
-    stats: &[f64],
-    pathway: &[usize],
-    name: &str,
-    gsea_param: f64,
-    score_type: &str,
-    gamma_cache: &HashMap<usize, Option<(GammaParams, GammaParams)>>,
-) -> GseaResult {
-    let size = pathway.len();
-
-    // Calculate observed ES
-    let (es, leading_edge) = calc_enrichment_score_sparse(stats, pathway, gsea_param);
-
-    // Apply score type filter
-    let filtered_es = match score_type {
-        "pos" => {
-            if es < 0.0 {
-                0.0
-            } else {
-                es
-            }
-        }
-        "neg" => {
-            if es > 0.0 {
-                0.0
-            } else {
-                es
-            }
-        }
-        _ => es, // "std" - use as-is
-    };
-
-    // Calculate p-value and NES
-    let (pval, nes) = if size < MIN_SIZE_FOR_GAMMA {
-        // Use permutation for small gene sets
-        let (p, mean_pos, mean_neg) = permutation_pvalue(stats, pathway, gsea_param, DEFAULT_N_PERM);
-        let n = calculate_nes_permutation(filtered_es, mean_pos, mean_neg);
-        (p, n)
-    } else {
-        // Use cached Gamma parameters (look up by size bin, not exact size)
-        let bin_size = get_size_bin(size);
-        match gamma_cache.get(&bin_size) {
-            Some(Some((pos_params, neg_params))) => {
-                let p = gamma_pvalue(filtered_es, pos_params, neg_params);
-                let n = calculate_nes(filtered_es, pos_params, neg_params);
-                (p, n)
-            }
-            _ => {
-                // Fallback to permutation if Gamma fitting failed
-                let (p, mean_pos, mean_neg) =
-                    permutation_pvalue(stats, pathway, gsea_param, DEFAULT_N_PERM);
-                let n = calculate_nes_permutation(filtered_es, mean_pos, mean_neg);
-                (p, n)
-            }
-        }
-    };
-
-    GseaResult {
-        pathway: name.to_string(),
-        es: filtered_es,
-        nes,
-        pval,
-        size,
-        leading_edge,
-    }
+        .collect()
 }
 
 /// Configuration for two-pass (coarse-to-fine) GSEA
@@ -439,51 +346,21 @@ pub fn run_gsea_parallel_two_pass(
     score_type: &str,
     config: &TwoPassConfig,
 ) -> (Vec<GseaResult>, usize, usize) {
-    // Pre-filter pathways by size
-    let filtered: Vec<(usize, &Vec<usize>, &String)> = pathways
-        .iter()
-        .zip(pathway_names.iter())
-        .enumerate()
-        .filter(|(_, (pathway, _))| {
-            let size = pathway.len();
-            size >= min_size && size <= max_size
-        })
-        .map(|(i, (pathway, name))| (i, pathway, name))
-        .collect();
-
+    let filtered = filter_pathways_by_size(pathways, pathway_names, min_size, max_size);
     if filtered.is_empty() {
         return (Vec::new(), 0, 0);
     }
 
-    // Collect unique size bins
-    let mut unique_bins: Vec<usize> = filtered
-        .iter()
-        .map(|(_, pathway, _)| get_size_bin(pathway.len()))
-        .filter(|&bin| bin >= MIN_SIZE_FOR_GAMMA)
-        .collect();
-    unique_bins.sort_unstable();
-    unique_bins.dedup();
+    let unique_bins = collect_unique_size_bins(&filtered);
 
     // === PASS 1: Coarse estimation ===
-    let coarse_cache: HashMap<usize, Option<(GammaParams, GammaParams)>> = unique_bins
-        .par_iter()
-        .map(|&bin_size| {
-            let params = fit_gamma_null(stats, bin_size, config.coarse_anchors, gsea_param).ok();
-            (bin_size, params)
-        })
-        .collect();
+    let coarse_cache = build_gamma_cache(stats, &unique_bins, config.coarse_anchors, gsea_param);
 
-    // Calculate coarse results and identify candidates
     let coarse_results: Vec<(usize, GseaResult, bool)> = filtered
         .par_iter()
         .map(|(idx, pathway, name)| {
-            let result = analyze_single_pathway_cached(
-                stats,
-                pathway,
-                name,
-                gsea_param,
-                score_type,
-                &coarse_cache,
+            let result = analyze_pathway_gamma(
+                stats, pathway, name, gsea_param, score_type, &coarse_cache,
             );
             let is_candidate = result.pval < config.pvalue_threshold;
             (*idx, result, is_candidate)
@@ -496,12 +373,10 @@ pub fn run_gsea_parallel_two_pass(
 
     for (idx, result, is_candidate) in coarse_results {
         if is_candidate {
-            // Find the original pathway data
             if let Some(&(_, pathway, name)) = filtered.iter().find(|(i, _, _)| *i == idx) {
                 candidates.push((idx, pathway, name));
             }
         } else {
-            // Keep coarse result for non-candidates
             final_results.push((idx, result));
         }
     }
@@ -511,35 +386,14 @@ pub fn run_gsea_parallel_two_pass(
 
     // === PASS 2: Fine estimation for candidates only ===
     if !candidates.is_empty() {
-        // Get unique bins for candidates only
-        let mut candidate_bins: Vec<usize> = candidates
-            .iter()
-            .map(|(_, pathway, _)| get_size_bin(pathway.len()))
-            .filter(|&bin| bin >= MIN_SIZE_FOR_GAMMA)
-            .collect();
-        candidate_bins.sort_unstable();
-        candidate_bins.dedup();
+        let candidate_bins = collect_unique_size_bins(&candidates);
+        let fine_cache = build_gamma_cache(stats, &candidate_bins, config.fine_anchors, gsea_param);
 
-        // Fit with more anchors
-        let fine_cache: HashMap<usize, Option<(GammaParams, GammaParams)>> = candidate_bins
-            .par_iter()
-            .map(|&bin_size| {
-                let params = fit_gamma_null(stats, bin_size, config.fine_anchors, gsea_param).ok();
-                (bin_size, params)
-            })
-            .collect();
-
-        // Calculate fine results
         let fine_results: Vec<(usize, GseaResult)> = candidates
             .par_iter()
             .map(|(idx, pathway, name)| {
-                let result = analyze_single_pathway_cached(
-                    stats,
-                    pathway,
-                    name,
-                    gsea_param,
-                    score_type,
-                    &fine_cache,
+                let result = analyze_pathway_gamma(
+                    stats, pathway, name, gsea_param, score_type, &fine_cache,
                 );
                 (*idx, result)
             })
@@ -548,9 +402,9 @@ pub fn run_gsea_parallel_two_pass(
         final_results.extend(fine_results);
     }
 
-    // Sort by original index to maintain order, then extract results
+    // Sort by original index to maintain order
     final_results.sort_by_key(|(idx, _)| *idx);
-    let results: Vec<GseaResult> = final_results.into_iter().map(|(_, r)| r).collect();
+    let results = final_results.into_iter().map(|(_, r)| r).collect();
 
     (results, coarse_count, fine_count)
 }
@@ -559,15 +413,6 @@ pub fn run_gsea_parallel_two_pass(
 ///
 /// Uses adaptive sampling that stops when parameters converge,
 /// typically using 40-60% fewer samples than fixed sampling.
-///
-/// # Arguments
-/// * `stats` - Gene statistics (should be sorted in decreasing order)
-/// * `pathways` - Vector of gene set indices (0-based)
-/// * `pathway_names` - Names of pathways
-/// * `gsea_param` - Weighting parameter
-/// * `min_size` - Minimum pathway size filter
-/// * `max_size` - Maximum pathway size filter
-/// * `score_type` - "std", "pos", or "neg"
 ///
 /// # Returns
 /// Tuple of (results, total_samples_used)
@@ -581,30 +426,10 @@ pub fn run_gsea_parallel_adaptive(
     score_type: &str,
 ) -> (Vec<GseaResult>, usize) {
     let config = AdaptiveConfig::default();
+    let filtered = filter_pathways_by_size(pathways, pathway_names, min_size, max_size);
+    let unique_bins = collect_unique_size_bins(&filtered);
 
-    // Pre-filter pathways by size
-    let filtered: Vec<(usize, &Vec<usize>, &String)> = pathways
-        .iter()
-        .zip(pathway_names.iter())
-        .enumerate()
-        .filter(|(_, (pathway, _))| {
-            let size = pathway.len();
-            size >= min_size && size <= max_size
-        })
-        .map(|(i, (pathway, name))| (i, pathway, name))
-        .collect();
-
-    // Collect unique size bins
-    let mut unique_bins: Vec<usize> = filtered
-        .iter()
-        .map(|(_, pathway, _)| get_size_bin(pathway.len()))
-        .filter(|&bin| bin >= MIN_SIZE_FOR_GAMMA)
-        .collect();
-    unique_bins.sort_unstable();
-    unique_bins.dedup();
-
-    // Pre-compute Gamma parameters with adaptive sampling
-    // Track total samples used
+    // Pre-compute Gamma parameters with adaptive sampling, tracking total samples
     let results_with_samples: Vec<(usize, Option<(GammaParams, GammaParams)>, usize)> = unique_bins
         .par_iter()
         .map(|&bin_size| {
@@ -615,27 +440,17 @@ pub fn run_gsea_parallel_adaptive(
         })
         .collect();
 
-    // Build cache and count total samples
     let mut gamma_cache: HashMap<usize, Option<(GammaParams, GammaParams)>> = HashMap::new();
     let mut total_samples = 0usize;
-
     for (bin_size, params, samples) in results_with_samples {
         gamma_cache.insert(bin_size, params);
         total_samples += samples;
     }
 
-    // Process all pathways
-    let results: Vec<GseaResult> = filtered
+    let results = filtered
         .par_iter()
         .map(|(_, pathway, name)| {
-            analyze_single_pathway_cached(
-                stats,
-                pathway,
-                name,
-                gsea_param,
-                score_type,
-                &gamma_cache,
-            )
+            analyze_pathway_gamma(stats, pathway, name, gsea_param, score_type, &gamma_cache)
         })
         .collect();
 
@@ -658,12 +473,6 @@ pub fn set_num_threads(n: usize) {
 /// 1. Pre-generate random samples once per size bin (shared across all pathways)
 /// 2. Batch compute ES values using vectorized operations
 /// 3. Reduced per-pathway overhead through batching
-///
-/// # Arguments
-/// Same as run_gsea_parallel
-///
-/// # Returns
-/// Vector of GSEA results
 pub fn run_gsea_parallel_batch(
     stats: &[f64],
     pathways: &[Vec<usize>],
@@ -676,37 +485,17 @@ pub fn run_gsea_parallel_batch(
 ) -> Vec<GseaResult> {
     let effective_anchors = n_anchors.max(DEFAULT_N_ANCHORS);
     let n = stats.len();
-
-    // Pre-filter pathways by size
-    let filtered: Vec<(usize, &Vec<usize>, &String)> = pathways
-        .iter()
-        .zip(pathway_names.iter())
-        .enumerate()
-        .filter(|(_, (pathway, _))| {
-            let size = pathway.len();
-            size >= min_size && size <= max_size
-        })
-        .map(|(i, (pathway, name))| (i, pathway, name))
-        .collect();
-
+    let filtered = filter_pathways_by_size(pathways, pathway_names, min_size, max_size);
     if filtered.is_empty() {
         return Vec::new();
     }
 
-    // Collect unique size bins
-    let mut unique_bins: Vec<usize> = filtered
-        .iter()
-        .map(|(_, pathway, _)| get_size_bin(pathway.len()))
-        .filter(|&bin| bin >= MIN_SIZE_FOR_GAMMA)
-        .collect();
-    unique_bins.sort_unstable();
-    unique_bins.dedup();
+    let unique_bins = collect_unique_size_bins(&filtered);
 
     // === BATCH OPTIMIZATION: Generate all random samples and compute ES at once ===
     let mut rng = thread_rng();
     let indices: Vec<usize> = (0..n).collect();
 
-    // Pre-generate random samples for ALL size bins (shared samples)
     let samples_per_bin: HashMap<usize, Vec<Vec<usize>>> = unique_bins
         .iter()
         .map(|&bin_size| {
@@ -722,14 +511,12 @@ pub fn run_gsea_parallel_batch(
         })
         .collect();
 
-    // Batch compute ES for all samples (this is the key optimization)
+    // Batch compute ES for all samples, then fit Gamma
     let gamma_cache: HashMap<usize, Option<(GammaParams, GammaParams)>> = unique_bins
         .par_iter()
         .map(|&bin_size| {
             if let Some(samples) = samples_per_bin.get(&bin_size) {
-                // Batch compute all ES values at once
                 let es_values = calc_batch_es(stats, bin_size, samples, gsea_param);
-                // Fit Gamma from pre-computed ES
                 let params = fit_gamma_from_es(&es_values).ok();
                 (bin_size, params)
             } else {
@@ -738,22 +525,12 @@ pub fn run_gsea_parallel_batch(
         })
         .collect();
 
-    // Process all pathways using cached parameters
-    let results: Vec<GseaResult> = filtered
+    filtered
         .par_iter()
         .map(|(_, pathway, name)| {
-            analyze_single_pathway_cached(
-                stats,
-                pathway,
-                name,
-                gsea_param,
-                score_type,
-                &gamma_cache,
-            )
+            analyze_pathway_gamma(stats, pathway, name, gsea_param, score_type, &gamma_cache)
         })
-        .collect();
-
-    results
+        .collect()
 }
 
 #[cfg(test)]
@@ -762,18 +539,15 @@ mod tests {
 
     #[test]
     fn test_parallel_gsea() {
-        // Create sorted stats with more realistic distribution
-        // Simulating gene expression: higher values at top, lower at bottom
         let n = 2000;
         let stats: Vec<f64> = (0..n)
-            .map(|i| 3.0 - (i as f64 / (n as f64 / 6.0))) // Range: 3.0 to -3.0
+            .map(|i| 3.0 - (i as f64 / (n as f64 / 6.0)))
             .collect();
 
-        // Create pathways with sufficient size for Gamma fitting
         let pathways: Vec<Vec<usize>> = vec![
-            (0..50).collect(),     // Top 50 genes - should be significant positive
-            (975..1025).collect(), // Middle genes - not significant
-            (1950..2000).collect(), // Bottom 50 genes - should be significant negative
+            (0..50).collect(),
+            (975..1025).collect(),
+            (1950..2000).collect(),
         ];
 
         let names: Vec<String> = vec![
@@ -783,38 +557,19 @@ mod tests {
         ];
 
         let results = run_gsea_parallel(
-            &stats, &pathways, &names, 1.0, 200, 10, // min_size = 10
-            1000, "std",
+            &stats, &pathways, &names, 1.0, 200, 10, 1000, "std",
         );
 
         assert_eq!(results.len(), 3);
 
-        // Top pathway should have positive ES
         let top = results.iter().find(|r| r.pathway == "TopPathway").unwrap();
         assert!(top.es > 0.0, "Top pathway ES should be positive: {}", top.es);
-        // P-value test relaxed due to stochastic nature of Gamma fitting
-        assert!(
-            top.pval <= 1.0,
-            "Top pathway p-value should be valid: {}",
-            top.pval
-        );
+        assert!(top.pval <= 1.0, "Top pathway p-value should be valid: {}", top.pval);
 
-        // Bottom pathway should have negative ES
-        let bottom = results
-            .iter()
-            .find(|r| r.pathway == "BottomPathway")
-            .unwrap();
-        assert!(
-            bottom.es < 0.0,
-            "Bottom pathway ES should be negative: {}",
-            bottom.es
-        );
+        let bottom = results.iter().find(|r| r.pathway == "BottomPathway").unwrap();
+        assert!(bottom.es < 0.0, "Bottom pathway ES should be negative: {}", bottom.es);
 
-        // Middle pathway ES should be closer to 0 than extremes
-        let middle = results
-            .iter()
-            .find(|r| r.pathway == "MiddlePathway")
-            .unwrap();
+        let middle = results.iter().find(|r| r.pathway == "MiddlePathway").unwrap();
         assert!(
             middle.es.abs() < top.es.abs(),
             "Middle pathway ES {} should be smaller than top {}",
@@ -825,11 +580,9 @@ mod tests {
 
     #[test]
     fn test_gamma_caching() {
-        // Test that pathways of same size share Gamma parameters
         let n = 1000;
         let stats: Vec<f64> = (0..n).map(|i| 2.0 - (i as f64 / 250.0)).collect();
 
-        // Multiple pathways of the same size
         let pathways: Vec<Vec<usize>> = vec![
             (0..30).collect(),
             (100..130).collect(),
@@ -844,11 +597,9 @@ mod tests {
             "Path4".to_string(),
         ];
 
-        // This should be fast because all pathways share the same Gamma params
         let results = run_gsea_parallel(&stats, &pathways, &names, 1.0, 100, 10, 1000, "std");
 
         assert_eq!(results.len(), 4);
-        // All results should have valid p-values
         for r in &results {
             assert!(r.pval >= 0.0 && r.pval <= 1.0);
         }
