@@ -13,7 +13,14 @@ superfastGSEA(
   eps = 1e-10,
   nproc = 0,
   gseaParam = 1,
-  nAnchors = 200
+  nAnchors = NULL,
+  method = c("gamma", "gamma_batch", "gamma_adaptive", "gamma_two_pass",
+    "empirical_gpd", "hybrid"),
+  pAdjustMethod = c("BH", "sidak", "bonferroni", "holm", "hochberg", "hommel",
+    "BY", "none"),
+  hybridSize = 50,
+  hybridPvalueThreshold = 0.1,
+  hybridNperm = 1000
 )
 }
 \arguments{
@@ -25,7 +32,7 @@ superfastGSEA(
 
 \item{maxSize}{Maximum gene set size (default: Inf)}
 
-\item{scoreType}{Score type: "std" (default, two-tailed), "pos" (positive only), "neg" (negative only}
+\item{scoreType}{Score type: "std" (default, two-tailed), "pos" (positive only), "neg" (negative only)}
 
 \item{eps}{Minimum p-value threshold (default: 1e-10)}
 
@@ -33,21 +40,62 @@ superfastGSEA(
 
 \item{gseaParam}{GSEA weighting parameter (default: 1)}
 
-\item{nAnchors}{Number of anchor samples for Gamma fitting (default: 200)}
+\item{nAnchors}{Number of anchor samples for distribution fitting.
+  For "gamma" method: default 200, minimum 200.
+  For "empirical_gpd" method: default 500, minimum 500 (recommended for accuracy).}
+
+\item{method}{Method for p-value estimation:
+  \itemize{
+    \item "gamma": Gamma distribution approximation (fast, default)
+    \item "gamma_adaptive": Gamma with adaptive sampling (stops when converged)
+    \item "gamma_two_pass": Two-pass coarse-to-fine (fastest for large datasets)
+    \item "empirical_gpd": Empirical CDF + GPD for tails (more accurate, uses EVT)
+    \item "hybrid": Use fgsea for small pathways, Gamma for large (highest accuracy, requires fgsea)
+  }}
+
+\item{pAdjustMethod}{Method for multiple testing correction:
+  \itemize{
+    \item "BH": Benjamini-Hochberg FDR control (default, standard in bioinformatics)
+    \item "sidak": Sidak FWER control (more conservative, like blitzGSEA)
+    \item "bonferroni": Bonferroni FWER control (most conservative)
+    \item "holm", "hochberg", "hommel", "BY", "none": Other methods from p.adjust()
+  }}
+
+\item{hybridSize}{Size threshold for hybrid method. Pathways with size < hybridSize
+  use fgsea (more accurate for small sets), others use Gamma (faster). Default: 50.}
+
+\item{hybridPvalueThreshold}{Not used in current implementation (kept for compatibility).}
+
+\item{hybridNperm}{Number of permutations for fgsea in hybrid method.
+  Default: 1000. Higher values = more accurate but slower.}
 }
 \value{
 A data.frame with columns:
-\item{pathway}{Pathway name}
-\item{pval}{Nominal p-value}
-\item{padj}{Benjamini-Hochberg adjusted p-value}
-\item{ES}{Enrichment Score}
-\item{NES}{Normalized Enrichment Score}
-\item{size}{Number of genes in pathway after filtering}
-\item{leadingEdge}{List of leading edge gene names}
+  \item{pathway}{Pathway name}
+  \item{pval}{Nominal p-value}
+  \item{padj}{Adjusted p-value (method specified by pAdjustMethod)}
+  \item{ES}{Enrichment Score}
+  \item{NES}{Normalized Enrichment Score}
+  \item{size}{Number of genes in pathway after filtering}
+  \item{leadingEdge}{List of leading edge gene names}
+  If pAdjustMethod includes multiple methods, additional columns (padj_sidak, etc.) are added.
 }
 \description{
-Performs fast GSEA using a Rust backend with Gamma distribution approximation.
+Performs fast GSEA using a Rust backend with distribution approximation.
 API is compatible with fgsea::fgsea().
+}
+\details{
+Two methods are available for p-value estimation:
+
+\strong{Gamma method (default):}
+Fast parametric approach that assumes enrichment scores follow a Gamma distribution.
+Uses 200 anchor samples per size bin. Best for speed when distributional assumption holds.
+
+\strong{Empirical+GPD method:}
+Semi-parametric approach using empirical CDF for the center of the distribution
+and Generalized Pareto Distribution (GPD) for the tails. Based on Extreme Value Theory.
+Uses 500+ anchor samples for reliable estimation. More accurate for extreme p-values
+and when the Gamma assumption may not hold.
 }
 \examples{
 \dontrun{
@@ -61,7 +109,11 @@ pathways <- list(
   pathway2 = paste0("gene", 500:550)
 )
 
-result <- superfastGSEA(pathways, stats)
+# Fast analysis with Gamma method (default)
+result_gamma <- superfastGSEA(pathways, stats, method = "gamma")
+
+# More accurate analysis with Empirical+GPD method
+result_gpd <- superfastGSEA(pathways, stats, method = "empirical_gpd")
 }
 
 }
